@@ -37,7 +37,7 @@ class LogStash::Outputs::Loggly < LogStash::Outputs::Base
   # The loggly http input key to send to.
   # This is usually visible in the Loggly 'Inputs' page as something like this:
   # ....
-  #     https://logs.hoover.loggly.net/inputs/abcdef12-3456-7890-abcd-ef0123456789
+  #     https://logs-01.loggly.net/inputs/abcdef12-3456-7890-abcd-ef0123456789
   #                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   #                                           \---------->   key   <-------------/
   # ....
@@ -59,6 +59,16 @@ class LogStash::Outputs::Loggly < LogStash::Outputs::Base
   # https://www.loggly.com/docs/source-groups/
   config :tag, :validate => :string, :default => "logstash"
 
+  # Retry count. 
+  # It may be possible that the request may timeout due to slow Internet connection
+  # if such condition appears, retry_count helps in retrying request for multiple times
+  # It will try to submit request until retry_count and then halt
+  config :retry_count, :validate => :number, :default => 5
+
+  # Can Retry.
+  # Setting this value true helps user to send multiple retry attempts if the first request fails
+  config :can_retry, :validate => :boolean, :default => true
+
   # Proxy Host
   config :proxy_host, :validate => :string
 
@@ -72,6 +82,13 @@ class LogStash::Outputs::Loggly < LogStash::Outputs::Base
   config :proxy_password, :validate => :password, :default => ""
 
 
+  # HTTP constants
+  HTTP_SUCCESS = "200"
+  HTTP_FOBIDDEN = "403"
+  HTTP_NOT_FOUND = "404"
+  HTTP_INTERNAL_SERVER_ERROR = "500"
+  HTTP_GATEWAY_TIMEOUT = "504"
+
   public
   def register
     # nothing to do
@@ -79,7 +96,7 @@ class LogStash::Outputs::Loggly < LogStash::Outputs::Base
 
   public
   def receive(event)
-    
+    return unless output?(event)
 
     if event == LogStash::SHUTDOWN
       finished
@@ -117,17 +134,48 @@ class LogStash::Outputs::Loggly < LogStash::Outputs::Base
       http.verify_mode = OpenSSL::SSL::VERIFY_NONE
     end
 
-    # post message
     request = Net::HTTP::Post.new(url.path)
     request.body = message
-    response = http.request(request)
 
-    if response.is_a?(Net::HTTPSuccess)
-      @logger.info("Event send to Loggly OK!")
-    else
-      @logger.warn("HTTP error", :error => response.error!)
+    # Variable for count total retries
+    totalRetries = 0
+
+    #try posting once when can_retry is false
+    if @can_retry == false
+      @retry_count = 1
     end
-  end # def send_event
- 
-end # class LogStash::Outputs::Loggly
 
+    
+    @retry_count.times do
+    begin
+      response = http.request(request)	
+      case response.code
+	    when HTTP_SUCCESS					# HTTP_SUCCESS :Code 2xx
+	      puts "Event send to Loggly"
+	    when HTTP_FOBIDDEN					# HTTP_FOBIDDEN :Code 403
+	      @logger.warn("User does not have privileges to execute the action.")
+	    when HTTP_NOT_FOUND					# HTTP_NOT_FOUND :Code 404
+	      @logger.warn("Invalid URL. Please check URL should be http://logs-01.loggly.com/inputs/CUSTOMER_TOKEN/tag/logstash")
+	    when HTTP_INTERNAL_SERVER_ERROR			# HTTP_INTERNAL_SERVER_ERROR :Code 500
+	      @logger.warn("Internal Server Error")
+	    when HTTP_GATEWAY_TIMEOUT				# HTTP_GATEWAY_TIMEOUT :Code 504
+	      @logger.warn("Gateway Time Out")
+	    else
+	      @logger.error("Unexpected response code", :code => response.code)
+      end # case
+
+    if [HTTP_SUCCESS,HTTP_FOBIDDEN,HTTP_NOT_FOUND].include?(response.code)	# break the retries loop for the specified response code
+      break
+    end
+    rescue StandardError => e
+      @logger.error("An unexpected error occurred", :exception => e.class.name, :error => e.to_s, :backtrace => e.backtrace)
+    end # rescue
+     
+    if totalRetries < @retry_count && totalRetries > 0
+      puts "Waiting for five seconds before retry..."
+      sleep(5)
+    end
+      totalRetries = totalRetries + 1
+    end #loop
+  end # def send_event
+end # class LogStash::Outputs::Loggly
